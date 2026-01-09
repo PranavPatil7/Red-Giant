@@ -1,0 +1,342 @@
+FROM ubuntu:noble-20250925
+
+RUN set -eux ; \
+  apt-get update ; \
+  apt-get -y install \
+    git cmake gcc g++ gfortran numactl gawk patch tar autoconf automake libtool nano which gpg less \
+    zlib1g-dev libncurses-dev graphviz wget ; \
+  apt-get clean ; \
+  rm -rf /var/lib/apt/lists/* ; \
+  true
+
+RUN set -eux ; \
+# Make the directory if it doesn't exist yet.
+# This location is recommended by the distribution maintainers.
+  mkdir --parents --mode=0755 /etc/apt/keyrings ; \
+# Download the key, convert the signing-key to a full
+# keyring required by apt and store in the keyring directory
+  wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+    gpg --dearmor | tee /etc/apt/keyrings/rocm.gpg > /dev/null
+
+ENV ROCM_RELEASE_MAJOR 7
+ENV ROCM_RELEASE_MINOR 1
+ENV ROCM_RELEASE_PATCH 1
+ENV ROCM_RELEASE $ROCM_RELEASE_MAJOR.$ROCM_RELEASE_MINOR.$ROCM_RELEASE_PATCH
+
+RUN set -eux ; \
+  export $(grep DISTRIB_CODENAME /etc/lsb-release) ; \
+  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_RELEASE $DISTRIB_CODENAME main" >> /etc/apt/sources.list.d/rocm.list ; \
+  true
+
+RUN set -eux ; \
+  echo 'Package: *' >> /etc/apt/preferences.d/rocm-pin-600 ; \
+  echo 'Pin: release o=repo.radeon.com' >> /etc/apt/preferences.d/rocm-pin-600 ; \
+  echo 'Pin-Priority: 600' >> /etc/apt/preferences.d/rocm-pin-600 ; \
+  true
+
+ARG MI_TARGET
+RUN set -eux ; \
+  apt-get update ; \
+  apt-get -y install \
+    rocm \
+    rocm-developer-tools \
+    rocm-hip-runtime-dev \
+    rocm-hip-sdk \
+    rocm-ml-sdk \
+    rocm-openmp-sdk \
+    miopen-hip-${MI_TARGET}kdb; \
+  apt-get clean ; \
+  rm -rf /var/lib/apt/lists/* ; \
+  true
+
+#
+# ROCm environment
+#
+ENV ROCM_PATH /opt/rocm-$ROCM_RELEASE
+ENV PATH $ROCM_PATH/bin:$ROCM_PATH/llvm/bin:$PATH
+ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:$ROCM_PATH/lib
+
+#
+# RCCL development 
+#
+ARG RCCL_VERSION
+RUN $WITH_CONDA ; set -eux ; \
+  rm -rf /opt/mybuild ; \
+  git clone https://github.com/rocm/rccl /opt/mybuild ; \
+  cd /opt/mybuild ; \
+  git checkout -b mydev $RCCL_VERSION ; \
+  git submodule sync ; \
+  git submodule update --init --recursive  ; \
+  mkdir /opt/mybuild/build ; \
+  cd  /opt/mybuild/build ; \
+  CXX=$ROCM_PATH/bin/hipcc \
+  cmake \
+    -DBUILD_LOCAL_GPU_TARGET_ONLY=ON \
+    -DCOMPILING_TARGETS=$MI_TARGET \
+    -DENABLE_MSCCLPP=OFF \
+    -DCMAKE_INSTALL_PREFIX=/opt/rccl \
+    -DCMAKE_BUILD_TYPE=Release \
+    .. ; \
+  nice make -j V=1 VERBOSE=1 ; \
+  nice make -j install ; \
+  cd / ; rm -rf /opt/mybuild
+
+
+ENV NCCL_SOCKET_IFNAME='hsn0,hsn1,hsn2,hsn3'
+ENV NCCL_NET_GDR_LEVEL=PHB
+ENV NCCL_NET_PLUGIN=librccl-net.so
+
+#
+# Latest libfabric build
+#
+
+RUN set -eux ; \
+  apt-get update ; \
+  apt-get -y install \
+    libconfig-dev \
+    libuv1-dev \
+    libfuse-dev \
+    libyaml-dev \
+    libnl-3-dev \
+    libnuma-dev \
+    libsensors-dev \
+    libcurl4-openssl-dev \
+    libjson-c-dev \
+    curl ; \
+  apt-get clean ; \
+  rm -rf /var/lib/apt/lists/* ; \
+  true
+
+ARG CASSINI_HEADERS_VERSION
+ARG CXI_DRIVER_VERSION
+ARG LIBCXI_VERSION
+
+RUN set -eux ; \
+  git clone --recursive https://github.com/HewlettPackard/shs-cassini-headers /opt/cassini-headers ; \
+  git -C /opt/cassini-headers checkout -b mydev $CASSINI_HEADERS_VERSION ; \
+  git clone --recursive https://github.com/HewlettPackard/shs-cxi-driver /opt/cxi-driver ; \
+  git -C /opt/cxi-driver  checkout -b mydev $CXI_DRIVER_VERSION ; \
+  git clone --recursive https://github.com/HewlettPackard/shs-libcxi /opt/shs-libcxi-src ; \
+  git -C /opt/shs-libcxi-src checkout -b mydev $LIBCXI_VERSION ; \
+  export CPATH=/opt/cassini-headers/include:/opt/cxi-driver/include ; \
+  \
+  cd /opt/shs-libcxi-src ; \
+  ./autogen.sh ; \
+  \
+  cd /opt/shs-libcxi-src ; \
+  CC=gcc \
+    CXX=g++ \
+    CFLAGS='-Wno-unused-but-set-variable' \
+      ./configure --prefix=/opt/shs-libcxi --with-rocm=$ROCM_PATH \
+        --without-systemd \
+        --with-systemdsystemunitdir=/opt/shs-libcxi/systemdsystemunitdir \
+        --with-udevrulesdir=/opt/shs-libcxi/udevrulesdir ; \
+  \
+  sed -i "s#/usr/share/cassini-headers#/opt/cassini-headers/share/cassini-headers#g" /opt/shs-libcxi-src/utils/cxi_dump_csrs.py ; \
+  \
+  cd /opt/shs-libcxi-src ; \
+  make VERBOSE=1 V=1 -j ; \
+  make VERBOSE=1 V=1 -j install ; \
+  \
+  mv /opt/shs-libcxi-src/include /opt/shs-libcxi/include ; \
+  cd / ; rm -rf /opt/shs-libcxi-src 
+
+ENV LD_LIBRARY_PATH=/opt/shs-libcxi/lib:$LD_LIBRARY_PATH
+
+ARG LIBFABRIC_VERSION
+
+RUN set -eux ; \
+  export CPATH=/opt/shs-libcxi/include:/opt/cassini-headers/include:/opt/cxi-driver/include ; \
+  export LIBRARY_PATH=/opt/shs-libcxi/lib ; \
+  \
+  git clone --recursive https://github.com/ofiwg/libfabric /opt/libfabric-src ; \
+  git -C /opt/libfabric-src checkout -b mydev $LIBFABRIC_VERSION ; \
+  \
+  cd /opt/libfabric-src ; \
+  ./autogen.sh ; \
+  \
+  mkdir /opt/libfabric-src/build ; \
+  \
+  cd /opt/libfabric-src/build ; \
+  ../configure CC=gcc --prefix=/opt/libfabric \
+    LDFLAGS=-Wl,--build-id --enable-only \
+    --enable-restricted-dl --enable-tcp --enable-udp --enable-rxm --enable-rxd --enable-hook_debug \
+    --enable-hook_hmem --enable-dmabuf_peer_mem --enable-cxi=/opt/shs-libcxi --enable-gdrcopy-dlopen --with-rocr=$ROCM_PATH ; \
+  \
+  cd /opt/libfabric-src/build ; \
+  nice make V=1 VERBOSE=1 -j  ; \
+  nice make V=1 VERBOSE=1 -j install ; \
+  \
+  cd / ; rm -rf /opt/libfabric-src
+
+ENV LIBFABRIC_PATH=/opt/libfabric
+ENV LD_LIBRARY_PATH=$LIBFABRIC_PATH/lib:$LD_LIBRARY_PATH
+
+#
+# HWLOC
+#
+
+ARG HWLOC_VERSION
+ARG HWLOC_PATCH_VERSION
+RUN set -eux ; \
+    cd /opt ;\
+    HWLOC_TAR=https://download.open-mpi.org/release/hwloc/v${HWLOC_VERSION}/hwloc-${HWLOC_VERSION}.${HWLOC_PATCH_VERSION}.tar.gz ; \
+    curl -LO  $HWLOC_TAR; \
+    tar -xzf hwloc-*.tar.gz ; rm -rf hwloc-*.tar.gz ; \
+    cd hwloc-${HWLOC_VERSION}.${HWLOC_PATCH_VERSION} ;\
+    CC=gcc ./configure --with-rocm=$ROCM_PATH --disable-rsmi --prefix=/opt/hwloc  --localstatedir=/var ;\
+    make install ; \
+    cd / ; rm -rf hwloc-*
+
+ENV PATH=/opt/hwloc/bin:$PATH
+ENV LD_LIBRARY_PATH=/opt/hwloc/lib:$LD_LIBRARY_PATH
+
+#
+# PMIX
+# 
+# RUN set -eux ; \
+#   apt-get update ; \
+#   apt-get -y install \
+#     libevent-dev ; \
+#   apt-get clean ; \
+#   rm -rf /var/lib/apt/lists/* ; \
+#   true
+
+# ARG PMIX_VERSION
+
+# RUN set -eux ; \
+#   cd /opt ; \
+#   curl -LO https://github.com/openpmix/openpmix/releases/download/v$PMIX_VERSION/pmix-$PMIX_VERSION.tar.gz ; \
+#   tar -xf pmix-*.tar.gz ; rm -rf pmix-*.tar.gz  ; \
+#   cd pmix-* ; \
+#   ./configure --prefix=/opt/pmix --with-hwloc=/opt/hwloc --enable-shared ; \
+#   make -j ; \
+#   make -j install ; \
+#   \
+#   cd /opt ; rm -rf pmix-* ; \
+#   true
+
+#
+# Add MPICH
+#
+
+RUN set -eux ; \
+  apt-get update ; \
+  apt-get -y install \
+    libpmi2-0-dev \
+    libpmix-dev ; \
+  apt-get clean ; \
+  rm -rf /var/lib/apt/lists/* ; \
+  true
+
+ARG MPICH_VERSION
+ENV MPICH_PATH=/opt/mpich
+
+RUN set -eux ; \
+    cd /opt ; \
+    MPICH_TAR=https://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz ; \
+    curl -LO  $MPICH_TAR ; \
+    tar -xzf mpich-$MPICH_VERSION.tar.gz; rm -rf mpich-$MPICH_VERSION.tar.gz ; \
+    cd /opt/mpich-* ;\
+    export CPATH=/usr/include/slurm:/usr/lib/x86_64-linux-gnu/pmix2/include ; \
+    CC=gcc CXX=g++  \
+        ./configure --prefix=$MPICH_PATH  \
+            --with-hip-lib=$ROCM_PATH/lib/  \
+            --with-hip-include=$ROCM_PATH/include/  \
+            --with-libfabric=/opt/libfabric  \
+            --disable-fortran \
+            --enable-fast=all,O3  \
+            --with-device=ch4:ofi:cxi \
+            --with-pm=no \
+            --disable-silent-rules \
+            --enable-debuginfo \
+            --with-hwloc=/opt/hwloc \
+            --enable-shared --with-pmi2 --with-pmix ;\
+    make -j ;\
+    make install ; \
+    cd / ; rm -rf /opt/mpich-*
+
+ENV PATH=$MPICH_PATH/bin:$PATH
+ENV LD_LIBRARY_PATH=$MPICH_PATH/lib:$LD_LIBRARY_PATH
+
+#
+# CXI plugin HPE and AWS versions
+#
+ARG CXI_PLUGIN_VERSION
+RUN set -eux ; \
+  git clone https://github.com/HewlettPackard/open-ofi-xccl.git /opt/cxi-plugin-src ; \
+  cd /opt/cxi-plugin-src ; \
+  git checkout -b mydev ${CXI_PLUGIN_VERSION} ; \
+  ./autogen.sh ; \  
+  CC=gcc ./configure \
+    --with-rocm=${ROCM_PATH} \
+    --prefix=/opt/cxi-plugin \
+    --with-rccl=/opt/rccl \
+    --with-libfabric=/opt/libfabric \
+    --with-hwloc=/opt/hwloc ; \
+  make -j install ; \
+  cd / ; rm -rf /opt/cxi-plugin-src
+  
+ARG CXI_PLUGIN_AWS_VERSION
+RUN set -eux ; \
+  git clone https://github.com/aws/aws-ofi-nccl /opt/cxi-plugin-aws-src ; \
+  cd /opt/cxi-plugin-aws-src ; \
+  git checkout -b mydev ${CXI_PLUGIN_AWS_VERSION} ; \
+  ./autogen.sh ; \  
+  CC=gcc ./configure \
+    --with-rocm=${ROCM_PATH} \
+    --prefix=/opt/cxi-plugin-aws \
+    --with-rccl=/opt/rccl \
+    --with-libfabric=/opt/libfabric \
+    --with-hwloc=/opt/hwloc ; \
+  make -j install ; \
+  cd / ; rm -rf /opt/cxi-plugin-aws-src
+
+ENV LD_LIBRARY_PATH $LD_LIBRARY_PATH:/opt/cxi-plugin-aws/lib:/opt/cxi-plugin/lib
+ENV OFI_NCCL_PROTOCOL=sendrecv
+
+#
+# Check https://support.hpe.com/hpesc/public/docDisplay?docId=dp00004854en_us&docLocale=en_US for details
+#
+ENV FI_MR_CACHE_MONITOR=userfaultfd
+ENV FI_CXI_DEFAULT_CQ_SIZE=131072
+# These deteriorate performance to lower node count:
+# ENV FI_CXI_RX_MATCH_MODE=software
+# ENV FI_CXI_RDZV_PROTO=alt_read
+# # Increase for larger jobs
+# ENV FI_CXI_REQ_BUF_SIZE=256
+
+#
+# RCCL tests
+#
+
+#
+# Add relevant libs to execution environment
+#
+ARG RCCL_TESTS_VERSION
+RUN set -eux ; \
+  git clone https://github.com/rocm/rccl-tests /opt/mybuild ; \
+  cd /opt/mybuild ; \
+  git checkout -b mydev $RCCL_TESTS_VERSION ; \
+  \
+  cd /opt/mybuild ; \
+  CC=gcc \
+    CXX=g++ \
+    MPI_HOME=$MPICH_PATH \
+    ROCM_PATH=$ROCM_PATH \
+    MPI=1 \
+    NCCL_HOME=$ROCM_PATH/rccl \
+    GPU_TARGETS=${MI_TARGET} \
+    nice make V=1 VERBOSE=1 -j ; \
+  mkdir /opt/rccltests ; \
+  mv /opt/mybuild/build/* /opt/rccltests ; \
+  rm -rf /opt/mybuild 
+
+
+RUN set -eux ; \
+    echo '#!/bin/bash' > /entry.sh ; \
+    echo 'PATH='"$PATH"' exec "$@"' >> /entry.sh ; \
+    chmod +x /entry.sh
+
+ENTRYPOINT [ "/entry.sh" ]
+CMD [ "/bin/bash" ]
