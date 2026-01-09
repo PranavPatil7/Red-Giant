@@ -1,4 +1,6 @@
-To run reframe tests for LLMs on CSCS Beverin, first start by cloning the official reframe repo into the "Large-Scale AI" repository
+Red Giant – Large Scale LLM Porting and Optimization on AMD GPUs                                   
+
+To run reframe tests for LLMs  first start by cloning the official reframe repo into the "Large-Scale AI" repository
 
 ```bash
 git clone https://github.com/reframe-hpc/reframe.git
