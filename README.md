@@ -1,4 +1,4 @@
-Red Giant – Large Scale LLM Porting and Optimization on AMD GPUs                                   
+## Red Giant – Large Scale LLM Porting and Optimization on AMD GPUs                                   
 
 To run reframe tests for LLMs  first start by cloning the official reframe repo into the "Large-Scale AI" repository
 
